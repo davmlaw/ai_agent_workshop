@@ -86,9 +86,38 @@ check "merge unsorted b.bed"     -- merge -i "$DATA/b.bed"
 check_stdin "merge stdin a.bed"       "$tmp/a.sorted.bed" -- merge -i -
 check_stdin "merge stdin -d 10 a.bed" "$tmp/a.sorted.bed" -- merge -d 10 -i -
 
+# --- intersect (issue #7) -------------------------------------------------
+# a.bed/b.bed carry the deliberate edge cases: position 0, zero-length,
+# bookended, nested, identical coordinates, and a chromosome present in -b
+# but not -a.
+check "intersect a-vs-b"        -- intersect     -a "$DATA/a.bed" -b "$DATA/b.bed"
+check "intersect -u a-vs-b"     -- intersect -u  -a "$DATA/a.bed" -b "$DATA/b.bed"
+check "intersect -v a-vs-b"     -- intersect -v  -a "$DATA/a.bed" -b "$DATA/b.bed"
+check "intersect -wa a-vs-b"    -- intersect -wa -a "$DATA/a.bed" -b "$DATA/b.bed"
+
+# -a from stdin
+check_stdin "intersect stdin"     "$DATA/a.bed" -- intersect     -a - -b "$DATA/b.bed"
+check_stdin "intersect -u stdin"  "$DATA/a.bed" -- intersect -u  -a - -b "$DATA/b.bed"
+check_stdin "intersect -v stdin"  "$DATA/a.bed" -- intersect -v  -a - -b "$DATA/b.bed"
+check_stdin "intersect -wa stdin" "$DATA/a.bed" -- intersect -wa -a - -b "$DATA/b.bed"
+
+# Real data at megabase coordinates. a.bed/b.bed all fit inside a single
+# 16kb bin, so they cannot catch a bug in how -b hits are ordered across
+# bins; genes.bed vs the GIAB high-confidence regions can.
+check "intersect genes-vs-highconf"     -- intersect     -a "$DATA/genes.bed" -b "$DATA/hg002.highconf.bed"
+check "intersect -u genes-vs-highconf"  -- intersect -u  -a "$DATA/genes.bed" -b "$DATA/hg002.highconf.bed"
+check "intersect -v genes-vs-highconf"  -- intersect -v  -a "$DATA/genes.bed" -b "$DATA/hg002.highconf.bed"
+check "intersect -wa genes-vs-highconf" -- intersect -wa -a "$DATA/genes.bed" -b "$DATA/hg002.highconf.bed"
+check "intersect highconf-vs-genes"     -- intersect     -a "$DATA/hg002.highconf.bed" -b "$DATA/genes.bed"
+
+# Data errors, where bedtools also exits 1 (SPEC §7).
+printf 'chr1\t100\tnope\n'  > "$tmp/noninteger.bed"
+printf 'chr1\t500\t400\n'   > "$tmp/backwards.bed"
+check "intersect non-integer coordinate" -- intersect -a "$tmp/noninteger.bed" -b "$DATA/b.bed"
+check "intersect start > end"            -- intersect -a "$tmp/backwards.bed"  -b "$DATA/b.bed"
+
 # Add the rest here. Suggested next cases:
-#   intersect, intersect -u/-v/-wa, subtract, closest, closest -d,
-#   and each command reading from stdin.
+#   subtract, closest, closest -d, and each command reading from stdin.
 
 echo "---"
 echo "$pass passed, $fail failed"
