@@ -63,10 +63,32 @@ check_stdin "sort stdin" "$DATA/a.bed" -- sort -i -
 : > "$tmp/empty.bed"
 check "sort empty" -- sort -i "$tmp/empty.bed"
 
-# Add the rest here. merge and closest need sorted input -- sort into $tmp first.
-# Suggested next cases:
-#   merge (default), merge -d 10, intersect, intersect -u/-v/-wa,
-#   subtract, closest, closest -d, and each command reading from stdin.
+# --- merge (issue #6) ------------------------------------------------------
+# merge needs sorted input and the fixtures are deliberately unsorted, so sort
+# them first. Deliberately with bedtools, not our own sort: preparing the input
+# with the code under test would let a sort bug hide a merge bug.
+for f in a b genes; do
+  bedtools sort -i "$DATA/$f.bed" > "$tmp/$f.sorted.bed"
+done
+
+check "merge a.bed"              -- merge -i "$tmp/a.sorted.bed"
+check "merge -d 10 a.bed"        -- merge -d 10 -i "$tmp/a.sorted.bed"
+check "merge -d 0 a.bed"         -- merge -d 0 -i "$tmp/a.sorted.bed"
+check "merge -d 1000 a.bed"      -- merge -d 1000 -i "$tmp/a.sorted.bed"
+check "merge -d -50 a.bed"       -- merge -d -50 -i "$tmp/a.sorted.bed"
+check "merge b.bed"              -- merge -i "$tmp/b.sorted.bed"
+check "merge -d 10 b.bed"        -- merge -d 10 -i "$tmp/b.sorted.bed"
+check "merge genes.bed"          -- merge -i "$tmp/genes.sorted.bed"
+check "merge hg002.highconf.bed" -- merge -i "$DATA/hg002.highconf.bed"   # already sorted
+# a.bed is unsorted on purpose: both must exit 1 with nothing on stdout.
+check "merge unsorted a.bed"     -- merge -i "$DATA/a.bed"
+check "merge unsorted b.bed"     -- merge -i "$DATA/b.bed"
+check_stdin "merge stdin a.bed"       "$tmp/a.sorted.bed" -- merge -i -
+check_stdin "merge stdin -d 10 a.bed" "$tmp/a.sorted.bed" -- merge -d 10 -i -
+
+# Add the rest here. Suggested next cases:
+#   intersect, intersect -u/-v/-wa, subtract, closest, closest -d,
+#   and each command reading from stdin.
 
 echo "---"
 echo "$pass passed, $fail failed"
