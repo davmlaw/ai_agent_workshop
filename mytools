@@ -4,14 +4,16 @@
 Subcommands arrive one issue at a time; see SPEC.md. Real bedtools is the oracle:
 if our output differs from it byte-for-byte on the same input, we are wrong.
 
-Implemented so far: --version, sort.
+Implemented so far: --version, sort, merge.
 """
 
 import sys
 
 VERSION = "0.1.0"
 
-USAGE = "usage: mytools --version\n       mytools sort -i <file|->"
+USAGE = """usage: mytools --version
+       mytools sort -i <file|->
+       mytools merge -i <file|-> [-d N]"""
 
 # Lines bedtools skips silently rather than parsing as intervals (SPEC.md section 2).
 SKIP_PREFIXES = ("#", "track", "browser")
@@ -23,6 +25,40 @@ class DataError(Exception):
 
 class UsageError(Exception):
     """Bad invocation. Exit 2 (SPEC.md section 7)."""
+
+
+class BufferedStdout:
+    """stdout writer whose pending output is dropped when we exit with an error.
+
+    bedtools prints nothing on stdout when it hits an out-of-order record, even
+    for the intervals it had already merged and "printed": its output sits in a
+    buffer that the error path never flushes. The golden tests diff stdout byte
+    for byte, so we do the same. The buffer is bounded, so merge still streams.
+    """
+
+    LIMIT = 1 << 16
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._parts = []
+        self._size = 0
+
+    def write(self, text):
+        self._parts.append(text)
+        self._size += len(text)
+        if self._size >= self.LIMIT:
+            self.flush()
+
+    def flush(self):
+        if self._parts:
+            self._stream.write("".join(self._parts))
+            self._parts = []
+            self._size = 0
+        self._stream.flush()
+
+    def discard(self):
+        self._parts = []
+        self._size = 0
 
 
 def parse_line(fields, source, lineno):
@@ -50,68 +86,78 @@ def parse_line(fields, source, lineno):
     return chrom, start, end
 
 
-def read_bed(path):
-    """Yield (chrom, start, end, fields) for each interval line in a BED file.
+def read_bed(stream, name):
+    """Yield (chrom, start, end, fields, lineno) for each interval line.
 
-    `path` may be "-" for stdin. Comment, track, browser and blank lines are
-    skipped silently, as bedtools does. Every line must carry the same number of
-    columns: that is stricter than bedtools and is a deliberate deviation
-    (SPEC.md section 8).
+    Takes an open stream rather than a path so callers can feed it a StringIO;
+    `open_input` turns a path or "-" into one. Comment, track, browser and blank
+    lines are skipped silently, as bedtools does. Every line must carry the same
+    number of columns: that is stricter than bedtools and is a deliberate
+    deviation (SPEC.md section 8). Aborts at the first bad line rather than
+    skipping it -- bedtools does.
+
+    Coordinates come through exactly as written; the zero-length quirk lives in
+    merge().
     """
-    if path == "-":
-        handle, source, close = sys.stdin, "stdin", False
-    else:
-        try:
-            handle, close = open(path, "r"), True
-        except OSError as err:
-            # A file the caller named but we cannot open is a caller problem, so
-            # exit 2. bedtools exits 1 here; SPEC.md section 7 makes exit 2 our own
-            # contract and keeps it out of the golden tests.
-            raise UsageError(f"cannot open {path}: {err.strerror}")
-        source = path
-
     ncols = None
+    for lineno, line in enumerate(stream, start=1):
+        line = line.rstrip("\n").rstrip("\r")
+        if not line.strip() or line.startswith(SKIP_PREFIXES):
+            continue
+
+        fields = line.split("\t")
+        if ncols is None:
+            ncols = len(fields)
+        elif len(fields) != ncols:
+            raise DataError(f"{name}:{lineno}: {len(fields)} columns, expected {ncols}")
+
+        chrom, start, end = parse_line(fields, name, lineno)
+        yield chrom, start, end, fields, lineno
+
+
+def open_input(path):
+    """Open path for reading, or stdin for `-`. Returns (stream, display name)."""
+    if path == "-":
+        return sys.stdin, "<stdin>"
     try:
-        for lineno, line in enumerate(handle, start=1):
-            line = line.rstrip("\n").rstrip("\r")
-            if not line.strip() or line.startswith(SKIP_PREFIXES):
-                continue
-
-            fields = line.split("\t")
-            if ncols is None:
-                ncols = len(fields)
-            elif len(fields) != ncols:
-                raise DataError(
-                    f"{source}:{lineno}: {len(fields)} columns, expected {ncols}"
-                )
-
-            chrom, start, end = parse_line(fields, source, lineno)
-            yield chrom, start, end, fields
-    finally:
-        if close:
-            handle.close()
+        return open(path, "r"), path
+    except OSError as exc:
+        # A file the caller named but we cannot open is a caller problem, so
+        # exit 2. bedtools exits 1 here; SPEC.md section 7 makes exit 2 our own
+        # contract and keeps it out of the golden tests.
+        raise UsageError(f"cannot open {path}: {exc.strerror}") from None
 
 
-def cmd_sort(argv):
-    """sort -i <file|->: chrom lexicographically, then start, then end."""
+def parse_sort_args(args):
+    """Return the input path for `sort`, or raise UsageError."""
     path = None
-    args = list(argv)
-    while args:
-        arg = args.pop(0)
+    rest = list(args)
+    while rest:
+        arg = rest.pop(0)
         if arg == "-i":
-            if not args:
+            if not rest:
                 raise UsageError("sort: -i requires a file argument")
             if path is not None:
                 raise UsageError("sort: -i given more than once")
-            path = args.pop(0)
+            path = rest.pop(0)
         else:
             raise UsageError(f"sort: unrecognised argument: {arg}")
     if path is None:
         raise UsageError("sort: -i is required")
+    return path
 
-    # sort is the one subcommand allowed to hold the whole input in memory
-    # (SPEC.md section 6).
-    records = list(read_bed(path))
+
+def cmd_sort(argv):
+    """sort -i <file|->: chrom lexicographically, then start, then end."""
+    path = parse_sort_args(argv)
+    stream, name = open_input(path)
+    try:
+        # sort is the one subcommand allowed to hold the whole input in memory
+        # (SPEC.md section 6).
+        records = list(read_bed(stream, name))
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
 
     # Chrom sorts lexicographically, not numerically, so chr17 precedes chr7.
     # Python compares strings by code point; bedtools compares std::string bytes.
@@ -128,9 +174,122 @@ def cmd_sort(argv):
     records.sort(key=lambda record: (record[0], record[1], record[2]))
 
     out = sys.stdout
-    for _chrom, _start, _end, fields in records:
-        out.write("\t".join(fields) + "\n")
+    for record in records:
+        out.write("\t".join(record[3]) + "\n")
     return 0
+
+
+def _cluster_row(chrom, start, end, count, original):
+    """The output row for one finished cluster.
+
+    A cluster of one prints the coordinates as they appeared in the file:
+    bedtools only lets the zero-length inflation below reach the output when the
+    feature actually merged with something. `chr1 500 500` alone prints
+    `chr1 500 500`, but next to `chr1 500 600` it prints `chr1 499 600`.
+    """
+    if count == 1:
+        return chrom, original[0], original[1]
+    return chrom, start, end
+
+
+def merge(records, d, name):
+    """Merge sorted records, yielding (chrom, start, end) rows. Streams.
+
+    Two features join when the gap between them is <= d. The gap between
+    `chr1 100 200` and `chr1 200 300` is 0, so bookended features merge at the
+    default d of 0 -- even though they do not *overlap* (SPEC.md section 3). A
+    negative d demands that much overlap instead, as in bedtools.
+    """
+    seen_chroms = set()
+    prev_chrom = None
+    prev_start = None
+    cluster = None  # (chrom, start, end, count, original)
+
+    for chrom, start, end, _fields, lineno in records:
+        if chrom != prev_chrom:
+            if chrom in seen_chroms:
+                raise DataError(
+                    f"{name}:{lineno}: chrom {chrom} seen again after {prev_chrom}; "
+                    "merge requires sorted input"
+                )
+            seen_chroms.add(chrom)
+            prev_chrom = chrom
+            prev_start = None
+        # Sortedness is judged on the coordinates as written, before the
+        # zero-length inflation below, which is what bedtools compares too.
+        if prev_start is not None and start < prev_start:
+            raise DataError(
+                f"{name}:{lineno}: out of order record ({chrom} {start} {end}); "
+                "merge requires sorted input"
+            )
+        prev_start = start
+
+        # bedtools inflates a zero-length feature by one base on each side before
+        # merging, so `chr1 500 500` reaches out to 499 and 501. Nobody predicts
+        # this; it is measured, not reasoned about (SPEC.md section 3).
+        if start == end:
+            lo, hi = start - 1, end + 1
+        else:
+            lo, hi = start, end
+
+        if cluster is not None and cluster[0] == chrom and lo - cluster[2] <= d:
+            # Input is sorted by start, so the cluster keeps the first record's
+            # start and only ever grows to the right.
+            cluster = (chrom, cluster[1], max(cluster[2], hi), cluster[3] + 1, cluster[4])
+        else:
+            if cluster is not None:
+                yield _cluster_row(*cluster)
+            cluster = (chrom, lo, hi, 1, (start, end))
+
+    if cluster is not None:
+        yield _cluster_row(*cluster)
+
+
+def parse_merge_args(args):
+    """Return (input path, d) for `merge`, or raise UsageError."""
+    path = None
+    d = 0
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-i", "-d"):
+            if i + 1 >= len(args):
+                raise UsageError(f"merge: {arg} requires an argument")
+            value = args[i + 1]
+            if arg == "-i":
+                path = value
+            else:
+                try:
+                    d = int(value)
+                except ValueError:
+                    raise UsageError(f"merge: -d requires an integer, got {value!r}") from None
+            i += 2
+        else:
+            raise UsageError(f"merge: unknown argument {arg!r}")
+    if path is None:
+        raise UsageError("merge: -i is required")
+    return path, d
+
+
+def cmd_merge(argv):
+    """merge -i <file|-> [-d N]: collapse overlapping/nearby sorted features."""
+    path, d = parse_merge_args(argv)
+    stream, name = open_input(path)
+    out = BufferedStdout(sys.stdout)
+    try:
+        for chrom, start, end in merge(read_bed(stream, name), d, name):
+            out.write(f"{chrom}\t{start}\t{end}\n")
+        out.flush()
+    except DataError:
+        out.discard()
+        raise
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
+    return 0
+
+
+COMMANDS = {"sort": cmd_sort, "merge": cmd_merge}
 
 
 def main(argv):
@@ -142,9 +301,9 @@ def main(argv):
         if not argv:
             raise UsageError("no subcommand given")
         command, rest = argv[0], argv[1:]
-        if command == "sort":
-            return cmd_sort(rest)
-        raise UsageError(f"unknown subcommand: {command}")
+        if command not in COMMANDS:
+            raise UsageError(f"unknown subcommand: {command}")
+        return COMMANDS[command](rest)
     except UsageError as err:
         # Errors go to stderr, never stdout -- stdout is data and gets piped.
         print(f"mytools: {err}", file=sys.stderr)
