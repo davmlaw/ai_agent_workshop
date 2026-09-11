@@ -71,13 +71,24 @@ class UsageErrors(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(out, "")
 
-    def test_subcommands_are_not_implemented_yet(self):
-        # #1 says stop at --version; the subcommands land in #5, #6 and #7.
-        # If one of those merges, this test is the reminder to update it.
-        for name in ("sort", "merge", "intersect", "subtract", "closest"):
+    def test_unimplemented_subcommands_are_rejected_by_name(self):
+        # Assert on the message, not just the code: an implemented subcommand
+        # called with no flags also exits 2 ("sort: -i is required"), so the
+        # exit code alone cannot tell "not built yet" from "built, used wrong".
+        for name in ("subtract", "closest"):
             with self.subTest(subcommand=name):
-                _, _, rc = run(name)
+                out, err, rc = run(name)
                 self.assertEqual(rc, 2)
+                self.assertIn(f"unknown subcommand: {name}", err)
+                self.assertEqual(out, "")
+
+    def test_implemented_subcommands_are_not_rejected_as_unknown(self):
+        # The tripwire for #6 and #7: when one of them merges, its name moves
+        # out of the list above and into this one.
+        for name in ("sort",):
+            with self.subTest(subcommand=name):
+                _, err, _ = run(name)
+                self.assertNotIn("unknown subcommand", err)
 
     def test_version_must_be_the_only_argument(self):
         _, _, rc = run("--version", "extra")
