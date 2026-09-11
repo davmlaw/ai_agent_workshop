@@ -4,7 +4,7 @@
 Subcommands arrive one issue at a time; see SPEC.md. Real bedtools is the oracle:
 if our output differs from it byte-for-byte on the same input, we are wrong.
 
-Implemented so far: --version, sort, merge.
+Implemented so far: --version, sort, merge, intersect.
 """
 
 import sys
@@ -13,7 +13,8 @@ VERSION = "0.1.0"
 
 USAGE = """usage: mytools --version
        mytools sort -i <file|->
-       mytools merge -i <file|-> [-d N]"""
+       mytools merge -i <file|-> [-d N]
+       mytools intersect -a <file|-> -b <file> [-u | -v | -wa]"""
 
 # Lines bedtools skips silently rather than parsing as intervals (SPEC.md section 2).
 SKIP_PREFIXES = ("#", "track", "browser")
@@ -86,33 +87,51 @@ def parse_line(fields, source, lineno):
     return chrom, start, end
 
 
+def parse_bed_line(line, path, lineno, ncols):
+    """Parse one BED line into (chrom, start, end, fields).
+
+    Returns None for comment/track/browser/blank lines, which are skipped
+    silently (SPEC.md section 2). `ncols` is the column count established by the
+    first data line of this file, or None if this is that line. Coordinate
+    validation is parse_line's job, so there is only ever one of it.
+    """
+    line = line.rstrip("\r\n")
+    if not line.strip() or line.startswith(SKIP_PREFIXES):
+        return None
+
+    fields = line.split("\t")
+    # Stricter than bedtools, which tolerates ragged files (SPEC.md sections 2, 8).
+    if ncols is not None and len(fields) != ncols:
+        raise DataError(f"{path}:{lineno}: {len(fields)} columns, expected {ncols}")
+
+    chrom, start, end = parse_line(fields, path, lineno)
+    return chrom, start, end, fields
+
+
 def read_bed(stream, name):
     """Yield (chrom, start, end, fields, lineno) for each interval line.
 
     Takes an open stream rather than a path so callers can feed it a StringIO;
-    `open_input` turns a path or "-" into one. Comment, track, browser and blank
-    lines are skipped silently, as bedtools does. Every line must carry the same
-    number of columns: that is stricter than bedtools and is a deliberate
-    deviation (SPEC.md section 8). Aborts at the first bad line rather than
-    skipping it -- bedtools does.
+    `open_input` turns a path or "-" into one. Aborts at the first bad line
+    rather than skipping it -- bedtools does.
 
     Coordinates come through exactly as written; the zero-length quirk lives in
-    merge().
+    merge() and fudge().
     """
     ncols = None
     for lineno, line in enumerate(stream, start=1):
-        line = line.rstrip("\n").rstrip("\r")
-        if not line.strip() or line.startswith(SKIP_PREFIXES):
+        record = parse_bed_line(line, name, lineno, ncols)
+        if record is None:
             continue
-
-        fields = line.split("\t")
         if ncols is None:
-            ncols = len(fields)
-        elif len(fields) != ncols:
-            raise DataError(f"{name}:{lineno}: {len(fields)} columns, expected {ncols}")
+            ncols = len(record[3])
+        yield record[0], record[1], record[2], record[3], lineno
 
-        chrom, start, end = parse_line(fields, name, lineno)
-        yield chrom, start, end, fields, lineno
+
+def iter_bed(handle, name):
+    """read_bed without the line number, for callers that do not report one."""
+    for chrom, start, end, fields, _lineno in read_bed(handle, name):
+        yield chrom, start, end, fields
 
 
 def open_input(path):
@@ -289,7 +308,196 @@ def cmd_merge(argv):
     return 0
 
 
-COMMANDS = {"sort": cmd_sort, "merge": cmd_merge}
+# --------------------------------------------------------------------------
+# Interval semantics
+# --------------------------------------------------------------------------
+#
+# BED is 0-based, half-open: chr1 100 200 covers bases 100..199. Two intervals
+# overlap iff a.start < b.end AND b.start < a.end -- strict < on both sides, so
+# bookended features (a.end == b.start) do NOT overlap.
+#
+# Zero-length features are the exception, and are not guessable. Measured
+# against bedtools v2.31.1:
+#
+#     a = chr1 0 100, b = chr1 50 50   ->  chr1 49 51
+#     a = chr1 0 100, b = chr1 100 100 ->  chr1 99 100
+#     a = chr1 100 100, b = chr1 0 100 ->  chr1 100 100
+#     a = chr1 100 100, b = chr1 99 99 ->  chr1 100 100
+#     a = chr1 100 100, b = chr1 98 98 ->  (nothing)
+#
+# The model that reproduces every one of those: a zero-length feature is
+# inflated by one base on each side before the overlap test, on BOTH sides of
+# the comparison. The clipped output region is then computed from -a's
+# ORIGINAL coordinates against -b's INFLATED ones -- note the asymmetry, which
+# is why `a = chr1 100 100, b = chr1 0 100` prints 100 100 and not 99 100.
+
+
+def fudge(start, end):
+    """Inflate a zero-length interval by 1bp each side, as bedtools does."""
+    if start == end:
+        return start - 1, end + 1
+    return start, end
+
+
+def overlaps(a_start, a_end, b_start, b_end):
+    """True iff the two intervals share a base. Coordinates must be fudged."""
+    return a_start < b_end and b_start < a_end
+
+
+# --------------------------------------------------------------------------
+# The -b index
+# --------------------------------------------------------------------------
+#
+# bedtools files every -b feature into a UCSC-style bin: seven levels, the
+# finest 2^14 = 16kb wide and each level 8x coarser. A query walks the finest
+# level first, ascending bin number, then each coarser level in turn; within a
+# bin, features come back in the order they were read.
+#
+# We copy that scheme rather than the sorted-array-plus-binary-search of
+# SPEC §6, because the search order IS the output order. Sorting -b hits by
+# start gives the wrong answer on the committed fixture: a02 (chr1 100 200)
+# overlaps b02 (chr1 100 100) and b03 (chr1 180 220), and bedtools prints the
+# b03 intersection first, because b03 is the earlier line in b.bed and both
+# land in the same bin. Both schemes are O(n log n)-ish and neither is
+# quadratic, so SPEC §6's real requirement still holds.
+
+_BIN_FIRST_SHIFT = 14   # finest bins are 2^14 = 16 kb
+_BIN_NEXT_SHIFT = 3     # each level up is 8x coarser
+_BIN_LEVELS = 7
+
+
+def bin_for(start, end):
+    """The (level, index) bin a feature is filed under."""
+    end -= 1
+    start >>= _BIN_FIRST_SHIFT
+    end >>= _BIN_FIRST_SHIFT
+    for level in range(_BIN_LEVELS):
+        if start == end:
+            return level, start
+        start >>= _BIN_NEXT_SHIFT
+        end >>= _BIN_NEXT_SHIFT
+    # Wider than the coarsest bin: bedtools drops it in bin 0 of the top level.
+    return _BIN_LEVELS - 1, 0
+
+
+def bins_to_search(start, end):
+    """Bin keys overlapping [start, end), in bedtools' traversal order."""
+    start_bin = start >> _BIN_FIRST_SHIFT
+    end_bin = (end - 1) >> _BIN_FIRST_SHIFT
+    for level in range(_BIN_LEVELS):
+        for index in range(start_bin, end_bin + 1):
+            yield level, index
+        start_bin >>= _BIN_NEXT_SHIFT
+        end_bin >>= _BIN_NEXT_SHIFT
+
+
+def load_b(path):
+    """Read -b fully into memory: {chrom: {bin: [(start, end), ...]}}.
+
+    Coordinates are stored already fudged, because that is what every later
+    comparison wants. No v1 flag prints any -b column, so only the coordinates
+    are kept.
+    """
+    handle, name = open_input(path)
+    index = {}
+    try:
+        for chrom, start, end, _fields in iter_bed(handle, name):
+            start, end = fudge(start, end)
+            index.setdefault(chrom, {}).setdefault(bin_for(start, end), []).append(
+                (start, end)
+            )
+    finally:
+        if handle is not sys.stdin:
+            handle.close()
+    return index
+
+
+def find_hits(index, chrom, start, end):
+    """Yield the fudged -b intervals overlapping [start, end), in bedtools order."""
+    chrom_bins = index.get(chrom)
+    if not chrom_bins:
+        return
+    for key in bins_to_search(start, end):
+        bucket = chrom_bins.get(key)
+        if bucket is None:
+            continue
+        for b_start, b_end in bucket:
+            if overlaps(start, end, b_start, b_end):
+                yield b_start, b_end
+
+
+# --------------------------------------------------------------------------
+# intersect
+# --------------------------------------------------------------------------
+
+
+def cmd_intersect(argv, out=None):
+    """mytools intersect -a <file|-> -b <file> [-u | -v | -wa]"""
+    out = out if out is not None else sys.stdout
+    a_path = b_path = None
+    mode = None  # None (clipped default), "u", "v" or "wa"
+
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg in ("-a", "-b"):
+            if not args:
+                raise UsageError(f"{arg} requires a file argument")
+            value = args.pop(0)
+            if arg == "-a":
+                a_path = value
+            else:
+                b_path = value
+        elif arg in ("-u", "-v", "-wa"):
+            flag = arg.lstrip("-")
+            if mode is not None and mode != flag:
+                raise UsageError(f"-{mode} and {arg} are mutually exclusive")
+            mode = flag
+        else:
+            raise UsageError(f"unknown argument: {arg}")
+
+    if a_path is None:
+        raise UsageError("intersect requires -a")
+    if b_path is None:
+        raise UsageError("intersect requires -b")
+    if b_path == "-":
+        raise UsageError("-b must be a real file; it is read fully into memory")
+
+    index = load_b(b_path)
+
+    a_handle, a_name = open_input(a_path)
+    write = out.write
+    try:
+        # -a streams and its input order is preserved: bedtools does not sort
+        # -a and neither do we.
+        for chrom, start, end, fields in iter_bed(a_handle, a_name):
+            f_start, f_end = fudge(start, end)
+            hits = find_hits(index, chrom, f_start, f_end)
+
+            if mode == "u":
+                if next(hits, None) is not None:
+                    write("\t".join(fields) + "\n")
+            elif mode == "v":
+                if next(hits, None) is None:
+                    write("\t".join(fields) + "\n")
+            elif mode == "wa":
+                original = "\t".join(fields) + "\n"
+                for _hit in hits:
+                    write(original)
+            else:
+                trailing = fields[3:]
+                for b_start, b_end in hits:
+                    # -a's ORIGINAL coordinates against -b's fudged ones.
+                    row = [chrom, str(max(start, b_start)), str(min(end, b_end))]
+                    row.extend(trailing)
+                    write("\t".join(row) + "\n")
+    finally:
+        if a_handle is not sys.stdin:
+            a_handle.close()
+    return 0
+
+
+COMMANDS = {"sort": cmd_sort, "merge": cmd_merge, "intersect": cmd_intersect}
 
 
 def main(argv):

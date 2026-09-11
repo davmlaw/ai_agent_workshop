@@ -89,8 +89,11 @@ prints nothing and exits 0.
 
 - `sort` holds the whole input in memory. Acceptable at our sizes.
 - `merge` streams, assuming sorted input. It does **not** sort for you (§7).
-- `intersect` loads `-b` into memory (grouped by chrom, sorted by start, binary-searched)
-  and streams `-a`. It must not be quadratic.
+- `intersect` loads `-b` into memory (grouped by chrom, then into UCSC-style bins as
+  bedtools does) and streams `-a`. It must not be quadratic. The bin scheme is not an
+  arbitrary choice of index: bedtools' bin traversal order **is** its output order for
+  the several `-b` features hit by one `-a` feature, so sorting `-b` by start and
+  binary-searching gives the right hits in the wrong order. [oracle]
 - Target: inputs up to ~10^6 intervals. No mmap, no index files, no threads.
 
 ## 7. Errors and exit codes
@@ -140,6 +143,13 @@ Exit codes are compared as well as stdout. A command that crashes silently other
 1. **Ragged column counts are an error** (§2). bedtools accepts them. Chosen for
    predictability. All three committed fixtures are uniformly BED6, so this deviation is
    not reachable by any golden test above.
+
+2. **A zero-length feature at position 0 in `-b` works** (`chr1 0 0`). bedtools inflates
+   zero-length features by one base each side before binning them, so this one becomes
+   `-1..1`, and bedtools aborts with `illegal bin number -1` and exit 1. We treat it as
+   an ordinary zero-length feature. Reproduce it with
+   `bedtools intersect -a data/b.bed -b data/a.bed` — `a12` is `chr2 0 0`. Not reachable
+   by any golden test above: `b.bed` has no zero-length feature at 0.
 
 ## 9. Language and layout
 
